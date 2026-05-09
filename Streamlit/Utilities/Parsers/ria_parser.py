@@ -1,108 +1,124 @@
 import asyncio
 import csv
-from datetime import date, timedelta, datetime, time
-from bs4 import BeautifulSoup
-import aiohttp
-import dateparser
-import pandas as pd
+from datetime import datetime, time, timedelta
+from pathlib import Path
 
-def daterange(start_date, end_date, revert=False):
-    if not revert:
-      delta = timedelta(days=1)
-      while start_date <= end_date:
-          yield start_date
-          start_date += delta
-    else:
-      delta = timedelta(days=1)
-      while start_date <= end_date:
-          yield end_date
-          end_date -= delta
-        
+import aiohttp
+import pandas as pd
+from bs4 import BeautifulSoup
+
+
+def daterange(start_date: datetime, end_date: datetime, reverse=False):
+    current = start_date.date()
+    last = end_date.date()
+    dates = []
+    while current <= last:
+        dates.append(current)
+        current += timedelta(days=1)
+    return reversed(dates) if reverse else dates
+
+
 async def fetch(session, url):
     try:
         async with session.get(url) as response:
             if response.status == 200:
                 return await response.text()
-            else:
-                return None
-    except TimeoutError:
-        print("Timeout error. Wait for 10 seconds...")
-        await asyncio.sleep(10)
-        return await fetch(session, url)
-    except aiohttp.client_exceptions.ClientConnectorError:
-        print("ClientConnectorError. Wait for 10 seconds...")
-        await asyncio.sleep(10)
-        return await fetch(session, url)
-    except aiohttp.client_exceptions.ClientOSError:
-        print("ClientOSError")
+            return None
+    except (TimeoutError, aiohttp.client_exceptions.ClientConnectorError, aiohttp.client_exceptions.ClientOSError):
         await asyncio.sleep(10)
         return await fetch(session, url)
 
-async def get_data(session, date):
-    url = f"https://ria.ru/services/lenta/more.html?date={date.strftime('%Y%m%d')}T"
-    url += "{}"
-    news_l = []
-    current_time = time(23, 59, 59)
-    formatted_time = current_time.strftime("%H%M%S")
-    is_yesterday = False
+
+async def parse_day(session, source_date):
+    url = f"https://ria.ru/services/lenta/more.html?date={source_date.strftime('%Y%m%d')}T"
+    rows = []
+    formatted_time = time(23, 59, 59).strftime("%H%M%S")
+
     while True:
-        link = url.format(formatted_time)
-        print(f"Making request for {link}")
-        page_content = await fetch(session, link)
-        if page_content:
-            soup = BeautifulSoup(page_content, 'html.parser')
-            news = soup.find_all('div', class_="list-item")
-            for n in news:
-                title = n.find('div', class_="list-item__content").find('a', class_="list-item__title color-font-hover-only").text
-                article_url = n.find('div', class_="list-item__content").find('a', class_="list-item__title color-font-hover-only")['href']
-                a_time = n.find('div', class_="list-item__info").find('div', class_="list-item__date").text
-                try:
-                    is_yesterday = int(a_time[0]) != date.day
-                except ValueError:
-                    print("ValueError")
-                    is_yesterday = a_time.split(",") == 2
-                if is_yesterday:
-                    break
-                splitted = a_time.replace(" ", "").split(',')
-                date_time = datetime.combine(date, datetime.strptime(splitted[1] if len(splitted) == 2 else splitted[0], "%H:%M").time())
-                formatted_date = date_time.strftime('%Y-%m-%d %H:%M:%S')
-                news_l.append(",".join([formatted_date, title, article_url]) + "\n")
-            print(f"Success {date.strftime('%Y/%m/%d')} {len(news)} {len(page_content)}")
-        else:
-            print(f"Failed {url.format(link)}")
-            continue
-        if is_yesterday:
-           break
-        else:
-            formatted_time = date_time.strftime("%H%M%S")
+        page_content = await fetch(session, f"{url}{formatted_time}")
+        if not page_content:
+            break
 
-    return news_l
-    
+        soup = BeautifulSoup(page_content, "html.parser")
+        news_items = soup.find_all("div", class_="list-item")
+        if not news_items:
+            break
+
+        reached_previous_day = False
+        last_datetime = None
+        for item in news_items:
+            content = item.find("div", class_="list-item__content")
+            info = item.find("div", class_="list-item__info")
+            if content is None or info is None:
+                continue
+
+            title_tag = content.find("a", class_="list-item__title color-font-hover-only")
+            date_tag = info.find("div", class_="list-item__date")
+            if title_tag is None or date_tag is None:
+                continue
+
+            date_text = date_tag.get_text(strip=True).replace(" ", "")
+            parts = date_text.split(",")
+            if len(parts) == 2:
+                try:
+                    item_day = int(parts[0])
+                except ValueError:
+                    item_day = source_date.day
+                if item_day != source_date.day:
+                    reached_previous_day = True
+                    break
+                clock = parts[1]
+            else:
+                clock = parts[0]
+
+            try:
+                last_datetime = datetime.combine(source_date, datetime.strptime(clock, "%H:%M").time())
+            except ValueError:
+                continue
+
+            rows.append([last_datetime.strftime("%Y-%m-%d %H:%M:%S"), title_tag.get_text(strip=True), title_tag["href"]])
+
+        if reached_previous_day or last_datetime is None:
+            break
+        next_time = last_datetime.strftime("%H%M%S")
+        if next_time == formatted_time:
+            break
+        formatted_time = next_time
+
+    return rows
+
+
+def normalize_csv(file_path):
+    path = Path(file_path)
+    if not path.exists() or path.stat().st_size == 0:
+        pd.DataFrame(columns=["datetime", "title", "url"]).to_csv(path, index=False)
+        return
+
+    df = pd.read_csv(path)
+    if df.empty:
+        pd.DataFrame(columns=["datetime", "title", "url"]).to_csv(path, index=False)
+        return
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df.dropna(subset=["datetime"]).drop_duplicates()
+    df = df.sort_values(by="datetime")
+    df.to_csv(path, index=False)
+
 
 async def main(start_date, end_date, file_path):
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists() and path.stat().st_size > 0
+
     async with aiohttp.ClientSession() as session:
-        for current_date in daterange(start_date, end_date, True):
-            articles = await get_data(session, current_date)
-            with open(file_path, mode='a', newline='', encoding='utf-8') as file:
-                print("Saving to file")
-                file.writelines(articles)
+        with open(path, mode="a", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow(["datetime", "title", "url"])
+            for current_date in daterange(start_date, end_date, reverse=True):
+                writer.writerows(await parse_day(session, current_date))
+    normalize_csv(path)
+
 
 def parse(start_date, end_date, file_path):
     asyncio.run(main(start_date, end_date, file_path))
-    with open(file_path, "r", encoding='utf-8') as f:
-        print("Checking everything")
-        df = f.readlines()
-    article_l = []
-    for line in df[1:]:
-        comma_index = line.find(',', line.find(',')+1)
-        ria = line[line.find(','):comma_index]
-        slash_index = line.find('https://')
-        title = line[comma_index + 1:slash_index-1]
-        url = line[slash_index:]
-        article_l.append([ria.strip(), title.strip(), url.strip()])
-    df = pd.DataFrame(article_l, columns=["datetime", "title", "url"])
-    df = df.drop_duplicates()
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.sort_values(by="datetime", inplace=True)
-    df.to_csv(file_path, index=False)
-parse(datetime.now() - timedelta(1), datetime.now(), "Data/News/ria.csv")

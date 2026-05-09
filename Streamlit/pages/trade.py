@@ -1,22 +1,21 @@
 import streamlit as st
 from utilities import get_tickers
-from func.ticker_page import show
 from Trading.Strategies.RandomStrategy import RandomStrategy
-from Trading.Strategies.LinearRegressionStrategy import LinearRegressionStrategy, RegressionSettings
 from Trading.Strategies.SMAStrategy import SMAStrategy
 from Trading.Strategies.TwoSMAStrategy import TwoSMAStrategy
 from Trading.Strategies.BollingerBandsStrategy import BollingerBandsStrategy
-from Trading.TradeStrategy import TradeStrategy
 from Trading.SimulationSystem import SimulationSystem
 from tickers import get_ticker_data
-import streamlit as st
 import plotly.graph_objects as go
 from Config import config
 import pandas as pd
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from Trading.launch_strategies import *
-from Config import config
+from Trading.launch_strategies import (
+    launch_bollinger_bands_strategy,
+    launch_MA_strategy,
+    launch_twoMA_strategy,
+)
 
 
 def pluralize(value, forms):
@@ -165,15 +164,16 @@ def draw():
     strategy_list.extend([strategy_item.name for strategy_item in trade_strategies.keys()])
     tickers_list = ["None"]
     tickers_list.extend(get_tickers())
+    filtered_df = None
     st.sidebar.title("Параметры графика")
     ticker = st.sidebar.selectbox("Выберите котировку:", tickers_list, index=1)
     trade_strategy = st.sidebar.selectbox("Стратегия торговли", strategy_list, index=1)
+    strategy_class = None
     if trade_strategy != "None":
-        strategy = None
         for item in trade_strategies.keys():
             if item.name == trade_strategy: 
-                strategy = item
-        st.sidebar.caption(strategy.description)
+                strategy_class = item
+        st.sidebar.caption(strategy_class.description)
     df = get_ticker_data(ticker)
     if not df is None:
         start_date = draw_date("Дата начала торговли", df)
@@ -181,26 +181,35 @@ def draw():
     else:
         start_date = datetime(1950, 1, 1)
         end_date = datetime.now()
-    commission = st.sidebar.slider("Коммиссия (в %)", 0.0, 5.0, step=0.01, value=0.0)
+    commission = st.sidebar.slider("Коммиссия (в %)", 0.0, 5.0, step=0.01, value=0.0) / 100
     initial_balance = st.sidebar.number_input("Начальный баланс", min_value=0, max_value=1000000, value=1000)
     sma = st.sidebar.toggle("Show SMA")
 
     if df is None:
         st.subheader("Для отображения информации выберите котировку с меню слева")
     else:
-        pass
-        # draw_graph(df, ticker, f'График акций {ticker}', "Main")
-        draw_graph(df[start_date < df['Date']][df['Date'] < end_date], ticker, f'График акций {ticker} за выбранный вами период', key="Date chosen",
-                   window_1=12 if sma else -1,
-                   window_2=48 if sma else -1)
-    if not trade_strategies[strategy] is None:
-        strategy = trade_strategies[strategy]()
-    else:
-        strategy = strategy()
+        filtered_df = df[(start_date < df['Date']) & (df['Date'] < end_date)]
+        if filtered_df.empty:
+            st.warning("В выбранном периоде нет данных")
+        else:
+            draw_graph(filtered_df, ticker, f'График акций {ticker} за выбранный вами период', key="Date chosen",
+                       window_1=12 if sma else -1,
+                       window_2=48 if sma else -1)
+    strategy = None
+    if strategy_class is not None:
+        strategy_factory = trade_strategies[strategy_class]
+        strategy = strategy_factory() if strategy_factory is not None else strategy_class()
     # Кнопка для начала торговли
-    if st.sidebar.button("Start trade", key="Trade button", disabled=(ticker == 'None' or trade_strategy == 'None' or initial_balance == 0)):
+    trade_disabled = (
+        ticker == 'None'
+        or strategy is None
+        or initial_balance == 0
+        or filtered_df is None
+        or filtered_df.empty
+    )
+    if st.sidebar.button("Start trade", key="Trade button", disabled=trade_disabled):
         simulation_system: SimulationSystem = SimulationSystem(
-            df[start_date < df['Date']][df['Date'] < end_date],
+            filtered_df,
             initial_balance=initial_balance,
             commission=commission
             )
@@ -219,7 +228,6 @@ def draw():
 
 trade_strategies = {
     RandomStrategy: None,
-    LinearRegressionStrategy: prepare_linear_regression,
     BollingerBandsStrategy: launch_bollinger_bands_strategy,
     SMAStrategy: launch_MA_strategy,
     TwoSMAStrategy: launch_twoMA_strategy,

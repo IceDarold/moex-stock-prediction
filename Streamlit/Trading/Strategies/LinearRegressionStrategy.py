@@ -6,9 +6,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import accuracy_score, classification_report, mean_absolute_error
+from sklearn.metrics import mean_absolute_error
 from datetime import timedelta, datetime
-import streamlit as st
 
 min_df_size = 100
 
@@ -25,7 +24,7 @@ class TooSmallDataframeError(Exception):
         super().__init__(f"The dataframe is too small for linear regression ({df_len} rows). It has to has at least {min_df_size} rows")
       
 class RegressionSettings:
-    def __init__(self, prediction_data, predicted_param="Close", start_date: datetime | str =0.1, random_state=42, features_number=10, is_log=True):
+    def __init__(self, prediction_data, predicted_param="Close", start_date: datetime | str =0.1, random_state=42, features_number=10, is_log=True, test_sample_size=0.1):
         """
         Args:
             prediction_data (DataFrame): The data, that uses for prediction of predicted_param with predicted_param itself for checking. 
@@ -37,13 +36,14 @@ class RegressionSettings:
         self.random_state = random_state
         self.start_date = start_date
         self.random_state = random_state
+        self.test_sample_size = test_sample_size
         if not isinstance(prediction_data, pd.DataFrame):
             raise ValueError("The type of prediction data is {}, but must be DataFrame".format(type(prediction_data)))
         self.prediction_data = prediction_data
 
 class LinearRegressionStrategy(TradeStrategy):
     name = "Линейная регрессия"
-    description = "Этот метод торговли работает на основе предсказаний будущих ценых с помощью линейной регрессии"
+    description = "Экспериментальная модель прогноза доходности на основе исторических OHLCV-признаков."
     def __init__(self):
         self.regression_settings = None
         self._trained_data = None
@@ -83,7 +83,7 @@ class LinearRegressionStrategy(TradeStrategy):
         required_columns = [item for item in ["Open", "Close", "High", "Low", "Volume", "Date"] if item not in except_list]
         for column in required_columns:
             if column not in df.columns:
-                raise f"There is no param {column}"
+                raise ValueError(f"There is no param {column}")
 
 
     def _generate_features_days_ago(self, df):
@@ -101,9 +101,7 @@ class LinearRegressionStrategy(TradeStrategy):
     
     def _convert_df(self, df) -> pd.DataFrame:
         new_df = df.copy()
-        # Преобразование колонок в datetime формат
-        new_df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y')
-        # Преобразование даты в числовой формат
+        new_df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         new_df["YVolume"] = df["Volume"].shift(1)
         new_df["YClose"] = df["Close"].shift(1)
         new_df = self._generate_features_days_ago(new_df)

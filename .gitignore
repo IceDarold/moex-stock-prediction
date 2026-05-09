@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+Streamlit/venv/
+
+# Streamlit/runtime artifacts
+.streamlit/secrets.toml
+Streamlit/output.csv
+Streamlit/Data/News/
+
+# Locally parsed market-data files. Existing tracked CSV snapshots stay tracked.
+Streamlit/Data/*.csv
+
+# IDE and OS files
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini

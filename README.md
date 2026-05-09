@@ -1,78 +1,102 @@
-# MOEX Stock Price Prediction
+# MOEX Trading Simulator
 
-This project is focused on creating a model to predict stock prices for companies listed on the Moscow Exchange (MOEX). It includes data collection, processing, analysis, and machine learning model building to forecast future stock prices. This project can serve as a tool for market analysis and investment decision-making support.
+Streamlit-приложение для просмотра исторических свечей Московской биржи и проверки простых торговых стратегий на прошлых данных.
 
-## Features
+Проект не подключается к брокеру и не выставляет реальные заявки. Сейчас это backtesting/simulation: приложение берет локальные CSV-файлы с котировками, прогоняет стратегию по выбранному периоду и показывает график баланса, количество покупок/продаж и итоговую прибыль или убыток.
 
-- **Data Collection:** The project automatically downloads historical stock price data from the Moscow Exchange.
-- **Data Preprocessing:** Cleans and transforms data to improve model quality.
-- **Model Building:** Utilizes a machine learning model trained on historical data to forecast stock prices.
-- **Result Analysis:** Visualizes prediction results and model accuracy metrics.
-- **Forecasting:** Predicts future stock prices based on the trained model.
+## Что умеет
 
-## Installation
+- Показывает график цены выбранного тикера: линия или свечи.
+- Меняет таймфрейм графика: `10T`, `30T`, `1H`, `1D`.
+- Загружает исторические свечи MOEX ISS для тикера с доски `TQBR` и сохраняет их в `Streamlit/Data/{TICKER}.csv`.
+- Загружает новости Lenta.ru и РИА в локальные CSV-файлы `Streamlit/Data/News/`.
+- Симулирует торговлю с начальным балансом и комиссией.
+- Поддерживает стратегии:
+  - случайная покупка/продажа;
+  - одна скользящая средняя;
+  - две скользящие средние;
+  - линии Боллинджера.
+- Содержит экспериментальный модуль обучения линейной регрессии на исторических OHLCV-данных.
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/IceDarold/moex-stock-prediction.git
-   cd moex-stock-prediction
-   ```
+## Быстрый старт
 
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Из корня репозитория:
 
-3. Obtain API keys to access data (e.g., Alpha Vantage or Yahoo Finance) and specify them in the configuration file.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r Streamlit\requirements.txt
+cd Streamlit
+streamlit run main_menu.py
+```
 
-## Usage
+Важно запускать `streamlit` из папки `Streamlit`: код использует относительные пути к `Data/` и `config.ini`.
 
-### Steps to Run
+## Как пользоваться
 
-1. **Data Collection:** Run `data_collection.py` to gather historical data.
-   ```bash
-   python data_collection.py
-   ```
+1. Откройте страницу симуляции торговли.
+2. Выберите тикер, период, стратегию, комиссию и начальный баланс.
+3. При необходимости включите отображение SMA на графике.
+4. Нажмите `Start trade`.
 
-2. **Model Training:** Run `train_model.py` to train the model on the collected data.
-   ```bash
-   python train_model.py
-   ```
+Если нужного тикера нет в списке, откройте страницу парсинга, введите тикер MOEX и запустите загрузку. После успешной загрузки появится CSV-файл в `Streamlit/Data/`.
 
-3. **Forecasting:** Run `predict.py` to predict prices for selected stocks.
-   ```bash
-   python predict.py --ticker SBER
-   ```
+На странице новостей можно выбрать период и загрузить новости из Lenta.ru и РИА. Данные сохраняются в `Streamlit/Data/News/lenta.csv` и `Streamlit/Data/News/ria.csv`; эти файлы считаются локальным кэшем и не добавляются в git.
 
-### Configuration
+## Обучение модели
 
-All script parameters, such as stock list, forecast period, and other settings, can be specified in the `config.json` file.
+Для быстрого прогона линейной регрессии по OHLCV-данным:
 
-## Project Structure
+```powershell
+python Streamlit\train_regression.py --tickers SBER GAZP LKOH MOEX YNDX
+```
 
-- `data_collection.py` - script for collecting historical data.
-- `train_model.py` - script for training the model.
-- `predict.py` - script for forecasting prices.
-- `config.json` - project configuration file.
-- `requirements.txt` - dependency file.
+Скрипт обучается на первой части временного ряда и тестируется на последнем отрезке без перемешивания. В выводе есть MAE, RMSE, MAPE, R2, точность направления и сравнение с baseline `следующий Close = предыдущий Close`.
 
-## Technologies
+## Данные
 
-- **Programming Language:** Python
-- **Libraries:** 
-  - `Pandas` for data manipulation
-  - `Scikit-Learn` or `TensorFlow` for machine learning model creation
-  - `Matplotlib`, `Seaborn` for data visualization
-- **Data Sources:** API for price data retrieval (e.g., Alpha Vantage)
+В `Streamlit/Data/` лежат CSV-снимки исторических свечей. Для работы графиков и симулятора файл тикера должен содержать колонки:
 
-## Future Plans
+```text
+Open, High, Low, Close, Volume, Date
+```
 
-- Support for more stocks.
-- Addition of an interface for data visualization and analysis.
-- Model improvements and new prediction methods.
+`Date` читается в одном из форматов:
 
-## Contributing
+- `dd-mm-YYYY`;
+- `YYYY-mm-dd HH:MM:SS`.
 
-If you have suggestions or would like to contribute, please open a Pull Request or create an Issue.
+Новые локально спарсенные CSV по умолчанию игнорируются git, чтобы случайно не раздувать репозиторий. Уже отслеживаемые CSV остаются частью проекта.
 
----
+## Структура
+
+```text
+Streamlit/
+  main_menu.py                 # точка входа Streamlit
+  pages/
+    trade.py                   # график и симуляция торговых стратегий
+    parse_stock.py             # загрузка свечей MOEX ISS
+    last_news.py               # загрузка и просмотр новостей
+  Trading/
+    SimulationSystem.py        # движок backtesting-симуляции
+    TradeStrategy.py           # базовый интерфейс стратегии
+    Strategies/                # реализации стратегий
+    launch_strategies.py       # параметры стратегий в sidebar
+  Utilities/
+    stock_parser.py            # загрузчик свечей с MOEX ISS
+    news_parser.py             # совместимость: Lenta parser
+    Parsers/                   # парсеры новостных источников
+  Data/                        # локальные CSV с историческими данными
+```
+
+## Ограничения
+
+- Это не торговый робот для реального рынка: `real_trade()` пока пустой, интеграции с брокером нет.
+- Симуляция исполняет сделки по цене `Close` текущей свечи и не учитывает проскальзывание, ликвидность, лоты и налоги.
+- Черновик `LinearRegressionStrategy.py` оставлен в коде как эксперимент, но не подключен к кнопке `Start trade`: в нём есть обучение модели и расчёт MAE, но торговый сигнал для общего симулятора ещё не доведён.
+- Новостной раздел сохраняет новости, но пока не связывает их с моделью и торговыми сигналами.
+- Тестов в проекте пока нет, поэтому после изменений стоит хотя бы запускать компиляцию Python-файлов и проверять основной экран Streamlit.
+
+## Что было очищено
+
+Из репозитория убраны виртуальное окружение, `__pycache__`, старый Flask-прототип и неиспользуемые helper-модули графика. Новостной раздел оставлен как экспериментальная фича, но переподключён без сетевых запросов при импорте. Для локальных артефактов добавлен `.gitignore`.
