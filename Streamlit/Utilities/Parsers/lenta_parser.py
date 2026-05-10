@@ -4,9 +4,35 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiohttp
-import dateparser
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
+
+REQUEST_TIMEOUT_SECONDS = 20
+MAX_FETCH_RETRIES = 2
+MAX_ARCHIVE_PAGES = 20
+USER_AGENT = "Mozilla/5.0 (compatible; moex-stock-prediction/1.0)"
+
+try:
+    import dateparser
+except ModuleNotFoundError:
+    dateparser = None
+
+
+MONTHS = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
 
 
 def daterange(start_date: datetime, end_date: datetime):
@@ -17,20 +43,54 @@ def daterange(start_date: datetime, end_date: datetime):
         current += timedelta(days=1)
 
 
-async def fetch(session, url):
+def fetch_with_requests(url):
     try:
-        async with session.get(url) as response:
-            if response.status == 200:
-                return await response.text()
-            return None
-    except (
-        TimeoutError,
-        aiohttp.client_exceptions.ClientConnectorError,
-        aiohttp.client_exceptions.ClientOSError,
-        aiohttp.client_exceptions.ClientPayloadError,
-    ):
-        await asyncio.sleep(10)
-        return await fetch(session, url)
+        response = requests.get(
+            url,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers={"User-Agent": USER_AGENT},
+        )
+    except requests.exceptions.RequestException:
+        return None
+
+    if response.status_code != 200:
+        return None
+    return response.text
+
+
+async def fetch(session, url):
+    for attempt in range(MAX_FETCH_RETRIES + 1):
+        page_content = await asyncio.to_thread(fetch_with_requests, url)
+        if page_content:
+            return page_content
+        if attempt < MAX_FETCH_RETRIES:
+            await asyncio.sleep(2)
+    return None
+
+
+def parse_lenta_datetime(raw_text, source_date):
+    if dateparser is not None:
+        parsed_date = dateparser.parse(
+            raw_text,
+            languages=["ru"],
+            settings={"RELATIVE_BASE": datetime.combine(source_date, datetime.min.time())},
+        )
+        if parsed_date is not None:
+            return parsed_date
+
+    normalized = raw_text.replace(",", " ").split()
+    if len(normalized) < 4:
+        return None
+
+    try:
+        hour, minute = map(int, normalized[0].split(":"))
+        day = int(normalized[1])
+        month = MONTHS[normalized[2].lower()]
+        year = int(normalized[3])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return datetime(year, month, day, hour, minute)
 
 
 def parse_page(page_content, source_date):
@@ -43,11 +103,7 @@ def parse_page(page_content, source_date):
         if link_tag is None or title_tag is None or time_tag is None:
             continue
 
-        parsed_date = dateparser.parse(
-            time_tag.get_text(strip=True),
-            languages=["ru"],
-            settings={"RELATIVE_BASE": datetime.combine(source_date, datetime.min.time())},
-        )
+        parsed_date = parse_lenta_datetime(time_tag.get_text(strip=True), source_date)
         if parsed_date is None:
             continue
 
@@ -60,8 +116,7 @@ def parse_page(page_content, source_date):
 
 async def parse_day(session, source_date):
     rows = []
-    page = 1
-    while True:
+    for page in range(1, MAX_ARCHIVE_PAGES + 1):
         url = f"https://lenta.ru/{source_date.strftime('%Y/%m/%d')}/page/{page}/"
         page_content = await fetch(session, url)
         if not page_content:
@@ -72,7 +127,6 @@ async def parse_day(session, source_date):
             break
 
         rows.extend(page_rows)
-        page += 1
     return rows
 
 
@@ -95,7 +149,8 @@ def normalize_csv(file_path):
 
 async def main(start_date, end_date, file_path):
     rows = []
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": USER_AGENT}) as session:
         for current_date in daterange(start_date, end_date):
             rows.extend(await parse_day(session, current_date))
 

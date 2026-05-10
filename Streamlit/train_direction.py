@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -120,7 +121,9 @@ NEGATIVE_WORDS = (
 @dataclass(frozen=True)
 class DirectionSelection:
     model_name: str
+    selection_mode: str
     threshold: float
+    top_coverage: float
     validation_accuracy: float
     validation_signal_accuracy: float
     validation_signal_coverage: float
@@ -128,6 +131,16 @@ class DirectionSelection:
     feature_columns: list[str]
     market_tickers_used: int
     news_rows_used: int
+
+
+@dataclass(frozen=True)
+class SignalSelector:
+    mode: str
+    threshold: float
+    top_coverage: float
+    accuracy: float
+    coverage: float
+    count: int
 
 
 def resolve_market_tickers(data_dir: Path, market_tickers: list[str]) -> list[str]:
@@ -142,6 +155,48 @@ def resolve_market_tickers(data_dir: Path, market_tickers: list[str]) -> list[st
 
 def load_resampled_ticker(data_dir: Path, ticker: str, timeframe: str | None) -> pd.DataFrame:
     return resample_ohlcv(load_ticker(data_dir, ticker), timeframe)
+
+
+def parse_cli_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%d")
+
+
+def resolve_lenta_range(
+    data_dir: Path,
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    days: int,
+) -> tuple[datetime, datetime]:
+    resolved_end = parse_cli_date(end)
+    if resolved_end is None:
+        max_dates = []
+        for ticker in tickers:
+            try:
+                df = load_ticker(data_dir, ticker.upper())
+            except (FileNotFoundError, ValueError):
+                continue
+            max_dates.append(df["Date"].max().to_pydatetime())
+        if not max_dates:
+            resolved_end = datetime.now()
+        else:
+            resolved_end = max(max_dates)
+
+    resolved_start = parse_cli_date(start)
+    if resolved_start is None:
+        resolved_start = resolved_end - timedelta(days=max(days - 1, 0))
+    return resolved_start, resolved_end
+
+
+def parse_lenta_news(news_dir: Path, start_date: datetime, end_date: datetime) -> Path:
+    from Utilities.Parsers import lenta_parser
+
+    news_dir.mkdir(parents=True, exist_ok=True)
+    output_path = news_dir / "lenta.csv"
+    lenta_parser.parse(start_date, end_date, output_path)
+    return output_path
 
 
 def build_market_features(
@@ -428,10 +483,17 @@ def signal_metrics(
     y_true: np.ndarray,
     probabilities: np.ndarray,
     threshold: float,
+    selection_mode: str = "threshold",
+    top_coverage: float = 100.0,
 ) -> tuple[float, float, int]:
     confidence = probabilities.max(axis=1)
     predictions = probabilities.argmax(axis=1)
-    selected = confidence >= threshold
+    if selection_mode == "top-percent":
+        count = max(1, int(len(confidence) * top_coverage / 100))
+        selected = np.zeros(len(confidence), dtype=bool)
+        selected[np.argsort(confidence)[-count:]] = True
+    else:
+        selected = confidence >= threshold
     if not selected.any():
         return float("nan"), 0.0, 0
     return (
@@ -441,41 +503,78 @@ def signal_metrics(
     )
 
 
-def tune_threshold(
+def tune_signal_selector(
     y_true: np.ndarray,
     probabilities: np.ndarray,
     target_accuracy: float,
     min_coverage: float,
-) -> tuple[float, float, float, int]:
+    selection_mode: str,
+    max_signal_coverage: float,
+) -> SignalSelector:
     full_accuracy = accuracy_score(y_true, probabilities.argmax(axis=1)) * 100
-    if full_accuracy >= target_accuracy:
-        return 0.5, full_accuracy, 100.0, len(y_true)
+    modes = ("threshold", "top-percent") if selection_mode == "auto" else (selection_mode,)
+    candidates = [
+        SignalSelector(
+            mode="threshold",
+            threshold=0.5,
+            top_coverage=100.0,
+            accuracy=full_accuracy,
+            coverage=100.0,
+            count=len(y_true),
+        )
+    ]
 
-    best_threshold = 0.5
-    best_accuracy = full_accuracy
-    best_coverage = 100.0
-    best_count = len(y_true)
-    target_reached = False
+    if "threshold" in modes:
+        for threshold in np.linspace(0.5, 0.995, 100):
+            signal_accuracy, coverage, count = signal_metrics(
+                y_true,
+                probabilities,
+                threshold=float(threshold),
+                selection_mode="threshold",
+            )
+            if count == 0 or coverage < min_coverage or coverage > max_signal_coverage:
+                continue
+            candidates.append(
+                SignalSelector(
+                    mode="threshold",
+                    threshold=float(threshold),
+                    top_coverage=coverage,
+                    accuracy=signal_accuracy,
+                    coverage=coverage,
+                    count=count,
+                )
+            )
 
-    for threshold in np.linspace(0.5, 0.95, 91):
-        signal_accuracy, coverage, count = signal_metrics(y_true, probabilities, threshold)
-        if count == 0 or coverage < min_coverage:
-            continue
+    if "top-percent" in modes:
+        upper = min(max_signal_coverage, 100.0)
+        for coverage in np.linspace(min_coverage, upper, 100):
+            signal_accuracy, actual_coverage, count = signal_metrics(
+                y_true,
+                probabilities,
+                threshold=0.5,
+                selection_mode="top-percent",
+                top_coverage=float(coverage),
+            )
+            if count == 0:
+                continue
+            candidates.append(
+                SignalSelector(
+                    mode="top-percent",
+                    threshold=0.5,
+                    top_coverage=float(coverage),
+                    accuracy=signal_accuracy,
+                    coverage=actual_coverage,
+                    count=count,
+                )
+            )
 
-        reached = signal_accuracy >= target_accuracy
-        if reached and (not target_reached or coverage > best_coverage):
-            target_reached = True
-            best_threshold = float(threshold)
-            best_accuracy = signal_accuracy
-            best_coverage = coverage
-            best_count = count
-        elif not target_reached and signal_accuracy > best_accuracy:
-            best_threshold = float(threshold)
-            best_accuracy = signal_accuracy
-            best_coverage = coverage
-            best_count = count
+    def rank(selector: SignalSelector) -> tuple:
+        reached = selector.accuracy >= target_accuracy
+        if target_accuracy >= 95:
+            return reached, selector.accuracy, -selector.coverage, selector.count
+        return reached, selector.coverage, selector.accuracy, selector.count
 
-    return best_threshold, best_accuracy, best_coverage, best_count
+    return max(candidates, key=rank)
 
 
 def evaluate_candidate(
@@ -486,7 +585,9 @@ def evaluate_candidate(
     validation_size: float,
     target_accuracy: float,
     min_coverage: float,
-) -> tuple[str, float, float, float, float]:
+    selection_mode: str,
+    max_signal_coverage: float,
+) -> tuple[str, SignalSelector, float]:
     train, validation, _ = split_train_validation_test(data, test_size, validation_size)
     model = create_classifier(model_name, feature_columns)
     model.fit(train[feature_columns], train["target_direction"])
@@ -495,13 +596,15 @@ def evaluate_candidate(
     validation_accuracy = (
         accuracy_score(validation_target, validation_probabilities.argmax(axis=1)) * 100
     )
-    threshold, signal_accuracy, signal_coverage, _ = tune_threshold(
+    selector = tune_signal_selector(
         validation_target,
         validation_probabilities,
         target_accuracy=target_accuracy,
         min_coverage=min_coverage,
+        selection_mode=selection_mode,
+        max_signal_coverage=max_signal_coverage,
     )
-    return model_name, threshold, validation_accuracy, signal_accuracy, signal_coverage
+    return model_name, selector, validation_accuracy
 
 
 def choose_direction_model(
@@ -512,6 +615,8 @@ def choose_direction_model(
     validation_size: float,
     target_accuracy: float,
     min_coverage: float,
+    selection_mode: str,
+    max_signal_coverage: float,
     market_tickers_used: int,
     news_rows_used: int,
 ) -> DirectionSelection:
@@ -525,22 +630,30 @@ def choose_direction_model(
             validation_size=validation_size,
             target_accuracy=target_accuracy,
             min_coverage=min_coverage,
+            selection_mode=selection_mode,
+            max_signal_coverage=max_signal_coverage,
         )
         for candidate in model_names
     ]
 
-    def rank(choice: tuple[str, float, float, float, float]) -> tuple[bool, float, float, float]:
-        _, _, validation_accuracy, signal_accuracy, signal_coverage = choice
-        reached = signal_accuracy >= target_accuracy
-        return reached, signal_coverage, signal_accuracy, validation_accuracy
+    def rank(choice: tuple[str, SignalSelector, float]) -> tuple:
+        candidate_model, selector, validation_accuracy = choice
+        reached = selector.accuracy >= target_accuracy
+        if target_accuracy >= 95:
+            model_priority = -AUTO_MODEL_CHOICES.index(candidate_model)
+            return reached, selector.accuracy, -selector.coverage, selector.count, model_priority
+        return reached, selector.coverage, selector.accuracy, validation_accuracy
 
     selected = max(choices, key=rank)
+    selected_model_name, selected_selector, selected_validation_accuracy = selected
     return DirectionSelection(
-        model_name=selected[0],
-        threshold=selected[1],
-        validation_accuracy=selected[2],
-        validation_signal_accuracy=selected[3],
-        validation_signal_coverage=selected[4],
+        model_name=selected_model_name,
+        selection_mode=selected_selector.mode,
+        threshold=selected_selector.threshold,
+        top_coverage=selected_selector.top_coverage,
+        validation_accuracy=selected_validation_accuracy,
+        validation_signal_accuracy=selected_selector.accuracy,
+        validation_signal_coverage=selected_selector.coverage,
         data=data,
         feature_columns=feature_columns,
         market_tickers_used=market_tickers_used,
@@ -564,6 +677,8 @@ def train_and_evaluate_direction(
     use_news: bool,
     target_accuracy: float,
     min_coverage: float,
+    selection_mode: str,
+    max_signal_coverage: float,
 ) -> dict[str, object]:
     ticker_df = load_resampled_ticker(data_dir, ticker, timeframe)
     market_features, market_tickers_used = build_market_features(
@@ -598,6 +713,8 @@ def train_and_evaluate_direction(
         validation_size=validation_size,
         target_accuracy=target_accuracy,
         min_coverage=min_coverage,
+        selection_mode=selection_mode,
+        max_signal_coverage=max_signal_coverage,
         market_tickers_used=market_tickers_used,
         news_rows_used=news_rows_used,
     )
@@ -614,8 +731,11 @@ def train_and_evaluate_direction(
         test_target,
         test_probabilities,
         selection.threshold,
+        selection_mode=selection.selection_mode,
+        top_coverage=selection.top_coverage,
     )
     majority_baseline = max(test_target.mean(), 1 - test_target.mean()) * 100
+    news_days_in_model = int((selection.data["news_count"] > 0).sum()) if "news_count" in selection.data else 0
 
     return {
         "samples": len(data),
@@ -624,7 +744,9 @@ def train_and_evaluate_direction(
         "test_from": test["Date"].iloc[0],
         "test_to": test["Date"].iloc[-1],
         "model": selection.model_name,
+        "selection_mode": selection.selection_mode,
         "threshold": selection.threshold,
+        "top_coverage": selection.top_coverage,
         "validation_accuracy": selection.validation_accuracy,
         "validation_signal_accuracy": selection.validation_signal_accuracy,
         "validation_signal_coverage": selection.validation_signal_coverage,
@@ -639,6 +761,7 @@ def train_and_evaluate_direction(
         "market_context": market_context,
         "market_tickers_used": selection.market_tickers_used,
         "news_rows_used": selection.news_rows_used,
+        "news_days_in_model": news_days_in_model,
     }
 
 
@@ -650,12 +773,14 @@ def print_result(ticker: str, result: dict[str, object], target_accuracy: float)
         f"test_period={result['test_from']} .. {result['test_to']}"
     )
     print(
-        f"model={result['model']} threshold={result['threshold']:.3f} "
+        f"model={result['model']} selection={result['selection_mode']} "
+        f"threshold={result['threshold']:.3f} top_coverage={result['top_coverage']:.2f}% "
         f"target_mode={result['target_mode']} market_scope={result['market_scope']} "
         f"market_context={result['market_context']}"
     )
     print(
-        f"market_tickers={result['market_tickers_used']} news_rows={result['news_rows_used']}"
+        f"market_tickers={result['market_tickers_used']} "
+        f"news_rows={result['news_rows_used']} news_days_in_model={result['news_days_in_model']}"
     )
     print(
         f"validation: full_accuracy={result['validation_accuracy']:.2f}% | "
@@ -709,6 +834,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-accuracy", type=float, default=70.0)
     parser.add_argument("--min-coverage", type=float, default=5.0)
+    parser.add_argument(
+        "--selection-mode",
+        choices=("auto", "threshold", "top-percent"),
+        default="auto",
+        help="auto uses confidence thresholds for normal targets and top-percent for very high targets.",
+    )
+    parser.add_argument(
+        "--max-signal-coverage",
+        type=float,
+        default=None,
+        help="Upper bound for selected signal coverage. Defaults to 0.5%% for targets >=95%%, otherwise 100%%.",
+    )
+    parser.add_argument(
+        "--parse-lenta-news",
+        action="store_true",
+        help="Fetch Lenta.ru archive rows into Data/News/lenta.csv before training.",
+    )
+    parser.add_argument("--news-start", default=None, help="Lenta start date: YYYY-MM-DD.")
+    parser.add_argument("--news-end", default=None, help="Lenta end date: YYYY-MM-DD.")
+    parser.add_argument(
+        "--news-days",
+        type=int,
+        default=7,
+        help="How many days to fetch when --news-start is omitted.",
+    )
     parser.add_argument("--no-news", dest="use_news", action="store_false")
     parser.set_defaults(use_news=True)
     return parser.parse_args()
@@ -716,6 +866,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.selection_mode == "auto":
+        selection_mode = "top-percent" if args.target_accuracy >= 95 else "threshold"
+    else:
+        selection_mode = args.selection_mode
+    max_signal_coverage = (
+        args.max_signal_coverage
+        if args.max_signal_coverage is not None
+        else (0.5 if args.target_accuracy >= 95 else 100.0)
+    )
+    min_coverage = min(args.min_coverage, max_signal_coverage)
+
+    if args.parse_lenta_news:
+        news_start, news_end = resolve_lenta_range(
+            data_dir=args.data_dir,
+            tickers=[ticker.upper() for ticker in args.tickers],
+            start=args.news_start,
+            end=args.news_end,
+            days=args.news_days,
+        )
+        output_path = parse_lenta_news(args.news_dir, news_start, news_end)
+        print(
+            f"parsed_lenta={output_path} "
+            f"period={news_start.date()}..{news_end.date()}"
+        )
+
     market_tickers = resolve_market_tickers(args.data_dir, args.market_tickers)
     for ticker in args.tickers:
         result = train_and_evaluate_direction(
@@ -733,7 +908,9 @@ def main() -> None:
             market_context=args.market_context,
             use_news=args.use_news,
             target_accuracy=args.target_accuracy,
-            min_coverage=args.min_coverage,
+            min_coverage=min_coverage,
+            selection_mode=selection_mode,
+            max_signal_coverage=max_signal_coverage,
         )
         print_result(ticker.upper(), result, args.target_accuracy)
 
